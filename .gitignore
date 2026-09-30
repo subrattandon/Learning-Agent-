@@ -27,6 +27,7 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
+.langgraph_api/
 
 # Jupyter artifacts
 .ipynb_checkpoints/
