@@ -22,6 +22,7 @@ import os
 import re
 import uuid
 import operator
+import asyncio
 
 from pathlib import Path
 from datetime import datetime
@@ -31,6 +32,7 @@ from typing_extensions import TypedDict
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
+    AIMessage,
     ToolMessage,
     filter_messages,
 )
@@ -214,7 +216,7 @@ def _find_relevant_markdown_file(files_dir: Path, topic: str) -> Optional[Path]:
 
     topic_tokens = _keywords(topic)
     if not topic_tokens:
-        return max(md_files, key=lambda f: f.stat().st_mtime)
+        return None
 
     best_file: Optional[Path] = None
     best_overlap_count = 0
@@ -233,10 +235,10 @@ def _find_relevant_markdown_file(files_dir: Path, topic: str) -> Optional[Path]:
         overlap_count = len(topic_tokens.intersection(doc_tokens))
         overlap_ratio = overlap_count / max(1, len(topic_tokens))
 
-        # Sufficiency gate: minimum content size and keyword coverage.
+        # Sufficiency gate: minimum content size and strong keyword coverage.
         content_word_count = len(content.split())
         is_sufficient = content_word_count >= 250 and (
-            overlap_count >= 3 or overlap_ratio >= 0.3
+            (overlap_count >= 2 and overlap_ratio >= 0.5) or overlap_ratio >= 0.7
         )
         if not is_sufficient:
             continue
@@ -270,11 +272,19 @@ def check_data_exists(state: LearningProjectState) -> Command[Literal["load_repo
     return Command(goto="load_report")
 
 
-def clarify_with_user(state: LearningProjectState) -> Command[Literal["check_data_exists", "__end__"]]:
+async def clarify_with_user(state: LearningProjectState) -> Command[Literal["check_data_exists", "__end__"]]:
     """Run scope clarification and route to data check when clarification is sufficient."""
-    result = scope_clarify_with_user(state)
+    result = await asyncio.to_thread(scope_clarify_with_user, state)
     if result.goto == "write_research_brief":
-        return Command(goto="check_data_exists", update=result.update)
+        topic = _extract_topic_text(state)
+        update = dict(result.update or {})
+        update["user_request"] = topic
+        # Ensure user sees a friendly starting confirmation if verification message is generic/N/A
+        msgs = update.get("messages", [])
+        content = msgs[0].content if msgs and hasattr(msgs[0], "content") else ""
+        if not content or content.strip() in ("N/A", "None", ""):
+            update["messages"] = [AIMessage(content=f"Starting your personalized learning session on: **{topic}**...")]
+        return Command(goto="check_data_exists", update=update)
     return result
 
 
@@ -294,8 +304,21 @@ def load_report(state: LearningProjectState):
         )
 
     report_content = selected_file.read_text(encoding="utf-8")
+    preview = report_content[:400].strip()
+    msg = AIMessage(
+        content=(
+            f"📚 **Found existing comprehensive report for your topic:** `{selected_file.name}`\n\n"
+            f"{preview}...\n\n"
+            f"---\n*Extracting learning checkpoints and preparing your roadmap...*"
+        )
+    )
 
-    return {"report": report_content}
+    return {
+        "report": report_content,
+        "final_report": report_content,
+        "user_request": topic,
+        "messages": [msg],
+    }
 
 
 def prepare_mcp_research(state: LearningProjectState):
@@ -394,10 +417,18 @@ async def final_report_generation(state: LearningProjectState):
 
     final_report = await writer_model.ainvoke([HumanMessage(content=final_report_prompt)])
 
+    msg = AIMessage(
+        content=(
+            f"# 📖 Comprehensive Research Report\n\n"
+            f"{final_report.content}\n\n"
+            f"---\n*Research complete! Generating your structured learning checkpoints...*"
+        )
+    )
+
     return {
         "final_report": final_report.content,
         "report": final_report.content,
-        "messages": ["Here is the final report: " + final_report.content],
+        "messages": [msg],
     }
 
 
@@ -415,18 +446,32 @@ async def save_report_to_file(state: LearningProjectState):
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(final_report)
 
-    return {"messages": [f"Report saved to: {filepath}"]}
+    return {}
 
 
-def generate_structure(state: LearningProjectState):
+async def generate_structure(state: LearningProjectState):
     print("--- Generating Structure ---")
-    report = state["report"]
+    report = state.get("report", state.get("final_report", ""))
+    user_req = state.get("user_request", state.get("research_brief", ""))
 
     structure_gen = get_structured_output_model(CheckpointResponse)
-    response = structure_gen.invoke(f"Extract learning checkpoints from this report: {report}")
+    report_excerpt = report[:3500] if len(report) > 3500 else report
+    prompt = f"""You are an expert curriculum designer. Extract 3 to 4 clear learning checkpoints from this material.
+
+Topic/Goal: {user_req or 'Learning concepts'}
+
+Report Overview:
+{report_excerpt}
+
+REQUIREMENTS:
+- Extract 3 to 4 logical, sequential checkpoints to teach this topic.
+- Each checkpoint must have a concise 'name' and a clear learning 'objective'.
+"""
+    response = await structure_gen.ainvoke(prompt)
 
     clean_checkpoints = []
-    for item in response.checkpoints:
+    # Limit to top 3 checkpoints for focused, responsive learning sessions
+    for item in response.checkpoints[:3]:
         data = item.model_dump()
         data["id"] = str(uuid.uuid4())
         data["study_material"] = ""
@@ -438,27 +483,65 @@ def generate_structure(state: LearningProjectState):
         data["simplified_material"] = ""
         clean_checkpoints.append(data)
 
-    return {"checkpoints": clean_checkpoints, "current_checkpoint_index": 0}
+    if not clean_checkpoints:
+        clean_checkpoints = [
+            {
+                "id": str(uuid.uuid4()),
+                "name": "Core Fundamentals",
+                "objective": f"Understand the foundational principles of {user_req or 'the topic'}",
+                "study_material": "",
+                "quiz_questions": [],
+                "user_answers": [],
+                "score": 0,
+                "passed": False,
+                "feedback": "",
+                "simplified_material": "",
+            }
+        ]
+
+    roadmap_items = "\n".join([f"{i+1}. **{cp['name']}**: {cp['objective']}" for i, cp in enumerate(clean_checkpoints)])
+    msg = AIMessage(
+        content=(
+            f"### 🎯 Learning Plan & Checkpoints\n"
+            f"Here is your personalized roadmap for this session:\n\n"
+            f"{roadmap_items}\n\n"
+            f"---\n*Preparing study materials and questions for each checkpoint...*"
+        )
+    )
+
+    return {
+        "checkpoints": clean_checkpoints,
+        "current_checkpoint_index": 0,
+        "messages": [msg],
+    }
 
 
-def create_content(state: LearningProjectState):
-    print("--- Creating Content (Batch) ---")
-    report = state["report"]
+async def create_content(state: LearningProjectState):
+    print("--- Creating Content ---")
+    report = state.get("report", state.get("final_report", ""))
     user_req = state.get("user_request", state.get("research_brief", ""))
-    checkpoints = state["checkpoints"]
+    checkpoints = state.get("checkpoints", [])
+    idx = state.get("current_checkpoint_index", 0)
+
+    if not checkpoints or idx >= len(checkpoints):
+        return {"checkpoints": checkpoints}
+
+    current_cp = checkpoints[idx]
+    # If the current checkpoint already has study material, skip LLM invocation
+    if current_cp.get("study_material"):
+        return {"checkpoints": checkpoints}
 
     content_gen = get_structured_output_model(CheckpointContent)
+    report_context = report[:2000] if len(report) > 2000 else report
 
-    prompts = []
-    for cp in checkpoints:
-        prompt = f"""You are creating educational content for a learning checkpoint.
+    prompt = f"""You are creating educational content for a learning checkpoint.
 
-Report Context: {report}
+Report Context: {report_context}
 User Goal: {user_req}
 
 Checkpoint Details:
-- Name: {cp['name']}
-- Objective: {cp['objective']}
+- Name: {current_cp['name']}
+- Objective: {current_cp.get('objective', '')}
 
 REQUIREMENTS:
 1. Create a clear, concise study material (approximately 100 words) that explains the key concepts of this checkpoint
@@ -473,83 +556,148 @@ Example format:
 - quiz_questions: ["What is X?", "Explain Y?", "How does Z work?"]
 
 Now create the content:"""
-        prompts.append(prompt)
 
-    results = content_gen.batch(prompts)
+    try:
+        res = await content_gen.ainvoke(prompt)
+        current_cp["study_material"] = res.study_material
+        current_cp["quiz_questions"] = res.quiz_questions
+    except Exception as e:
+        print(f"Error generating content for {current_cp['name']}: {e}")
+        current_cp["study_material"] = f"Key concepts for {current_cp['name']}: {current_cp.get('objective', '')}."
+        current_cp["quiz_questions"] = [
+            f"What is the main objective of {current_cp['name']}?",
+            f"How is {current_cp['name']} applied in practice?",
+            f"What is a key benefit of mastering {current_cp['name']}?",
+        ]
 
-    updated_checkpoints = []
-    for cp, res in zip(checkpoints, results):
-        cp["study_material"] = res.study_material
-        cp["quiz_questions"] = res.quiz_questions
-        updated_checkpoints.append(cp)
-
-    return {"checkpoints": updated_checkpoints}
+    checkpoints[idx] = current_cp
+    return {"checkpoints": checkpoints}
 
 
-def administer_quiz(state: LearningProjectState):
+def teach_checkpoint(state: LearningProjectState):
     idx = state.get("current_checkpoint_index", 0)
-    checkpoints = state["checkpoints"]
+    checkpoints = state.get("checkpoints", [])
 
     if idx >= len(checkpoints):
         return {}
 
     current_cp = checkpoints[idx]
-    material = current_cp["simplified_material"] if current_cp["simplified_material"] else current_cp["study_material"]
+    material = current_cp.get("study_material", "")
+    questions_list = "\n".join([f"**Q{i+1}:** {q}" for i, q in enumerate(current_cp.get("quiz_questions", []))])
+
+    msg = AIMessage(
+        content=(
+            f"## 📘 Checkpoint {idx + 1}: {current_cp['name']}\n\n"
+            f"**Objective:** {current_cp.get('objective', '')}\n\n"
+            f"### 📖 Study Material\n{material}\n\n"
+            f"---\n"
+            f"### ❓ Assessment Questions\n{questions_list}\n\n"
+            f"*(Submit your answers below to complete this checkpoint)*"
+        )
+    )
+    return {"messages": [msg]}
+
+
+def administer_quiz(state: LearningProjectState):
+    idx = state.get("current_checkpoint_index", 0)
+    checkpoints = state.get("checkpoints", [])
+
+    if idx >= len(checkpoints):
+        return {}
+
+    current_cp = checkpoints[idx]
+    material = current_cp["simplified_material"] if current_cp.get("simplified_material") else current_cp.get("study_material", "")
 
     user_view = {
         "title": current_cp["name"],
         "material": material,
-        "questions": current_cp["quiz_questions"],
+        "questions": current_cp.get("quiz_questions", []),
     }
 
     user_answers = interrupt(user_view)
 
-    current_cp["user_answers"] = user_answers
+    # Normalize user answers to list of strings
+    if isinstance(user_answers, str):
+        answers_list = [user_answers]
+    elif isinstance(user_answers, list):
+        answers_list = [str(a) for a in user_answers]
+    elif isinstance(user_answers, dict):
+        answers_list = [f"{k}: {v}" for k, v in user_answers.items()]
+    else:
+        answers_list = [str(user_answers)]
+
+    current_cp["user_answers"] = answers_list
     checkpoints[idx] = current_cp
-    return {"checkpoints": checkpoints}
+
+    answers_summary = "\n".join([f"- **A{i+1}:** {a}" for i, a in enumerate(answers_list)])
+    return {
+        "checkpoints": checkpoints,
+        "messages": [AIMessage(content=f"📝 **Your Submission for {current_cp['name']}:**\n{answers_summary}")],
+    }
 
 
-def evaluate_submission(state: LearningProjectState):
-    idx = state["current_checkpoint_index"]
-    checkpoints = state["checkpoints"]
+async def evaluate_submission(state: LearningProjectState):
+    idx = state.get("current_checkpoint_index", 0)
+    checkpoints = state.get("checkpoints", [])
+    if idx >= len(checkpoints):
+        return {}
     current_cp = checkpoints[idx]
 
     evaluator_gen = get_structured_output_model(EvaluationResult)
     prompt = f"""
     Topic: {current_cp['name']}
-    Questions: {current_cp['quiz_questions']}
-    Answers: {current_cp['user_answers']}
-    Rubric: Pass mark is 70.
+    Objective: {current_cp.get('objective', '')}
+    Study Material: {current_cp.get('study_material', '')}
+    Questions: {current_cp.get('quiz_questions', [])}
+    Student Answers: {current_cp.get('user_answers', [])}
+    Rubric: Pass mark is 70 out of 100.
     """
-    result = evaluator_gen.invoke(prompt)
+    result = await evaluator_gen.ainvoke(prompt)
 
-    current_cp["score"] = result.score
+    # Normalize score to 100-point scale if model scored out of 10
+    normalized_score = result.score * 10 if (0 < result.score <= 10) else result.score
+    current_cp["score"] = normalized_score
     current_cp["passed"] = result.passed
     current_cp["feedback"] = result.feedback
     checkpoints[idx] = current_cp
 
+    status_icon = "✅" if result.passed else "❌"
+    status_text = "PASSED" if result.passed else "NEEDS REVIEW"
+    eval_msg = AIMessage(
+        content=(
+            f"### {status_icon} Evaluation: {status_text} (Score: {normalized_score}/100)\n\n"
+            f"**Feedback:**\n{result.feedback}\n"
+        )
+    )
+
     next_idx = idx + 1 if result.passed else idx
-    return {"checkpoints": checkpoints, "current_checkpoint_index": next_idx}
+    return {
+        "checkpoints": checkpoints,
+        "current_checkpoint_index": next_idx,
+        "messages": [eval_msg],
+    }
 
 
-def simplified_teaching(state: LearningProjectState):
-    idx = state["current_checkpoint_index"]
-    checkpoints = state["checkpoints"]
+async def simplified_teaching(state: LearningProjectState):
+    idx = state.get("current_checkpoint_index", 0)
+    checkpoints = state.get("checkpoints", [])
+    if idx >= len(checkpoints):
+        return {}
     current_cp = checkpoints[idx]
 
     simplified_gen = get_structured_output_model(SimplifiedContent)
     prompt = f"""The student struggled with this topic. Use the FEYNMAN TECHNIQUE to create a MUCH SIMPLER explanation.
 
 Topic: {current_cp['name']}
-Original Explanation: {current_cp['study_material']}
+Original Explanation: {current_cp.get('study_material', '')}
 
 Questions Asked:
-{chr(10).join([f"{i+1}. {q}" for i, q in enumerate(current_cp['quiz_questions'])])}
+{chr(10).join([f"{i+1}. {q}" for i, q in enumerate(current_cp.get('quiz_questions', []))])}
 
 Student's Answers:
-{chr(10).join([f"{i+1}. {a}" for i, a in enumerate(current_cp['user_answers'])])}
+{chr(10).join([f"{i+1}. {a}" for i, a in enumerate(current_cp.get('user_answers', []))])}
 
-Feedback on Their Answers: {current_cp['feedback']}
+Feedback on Their Answers: {current_cp.get('feedback', '')}
 
 FEYNMAN TECHNIQUE RULES:
 1. Use ONLY simple, everyday language - avoid all technical jargon
@@ -561,24 +709,48 @@ FEYNMAN TECHNIQUE RULES:
 
 Create a simplified explanation that helps the student understand the concept:"""
 
-    result = simplified_gen.invoke(prompt)
+    result = await simplified_gen.ainvoke(prompt)
     current_cp["simplified_material"] = result.simplified_material
     checkpoints[idx] = current_cp
 
-    return {"checkpoints": checkpoints}
+    questions_list = "\n".join([f"**Q{i+1}:** {q}" for i, q in enumerate(current_cp.get('quiz_questions', []))])
+    msg = AIMessage(
+        content=(
+            f"## 💡 Let's Simplify This (Feynman Technique)\n\n"
+            f"**Topic: {current_cp['name']}**\n\n"
+            f"{result.simplified_material}\n\n"
+            f"---\n"
+            f"### 🔄 Retake Quiz Questions:\n{questions_list}\n\n"
+            f"*(Review the simplified explanation above and submit your answers to try again)*"
+        )
+    )
+
+    return {"checkpoints": checkpoints, "messages": [msg]}
 
 
-def decide_next_step(state: LearningProjectState) -> Literal["administer_quiz", "simplified_teaching", "__end__"]:
-    idx = state["current_checkpoint_index"]
-    checkpoints = state["checkpoints"]
+def course_completed(state: LearningProjectState):
+    msg = AIMessage(
+        content=(
+            f"## 🎓 Learning Session Complete!\n\n"
+            f"Congratulations! You have successfully completed and mastered all checkpoints for this topic.\n\n"
+            f"Feel free to ask any questions or start a new learning topic anytime!"
+        )
+    )
+    return {"messages": [msg]}
+
+
+def decide_next_step(state: LearningProjectState) -> Literal["create_content", "simplified_teaching", "course_completed"]:
+    idx = state.get("current_checkpoint_index", 0)
+    checkpoints = state.get("checkpoints", [])
 
     if idx >= len(checkpoints):
-        return END
+        return "course_completed"
 
     current_cp = checkpoints[idx]
-    if "passed" in current_cp and current_cp["passed"] is False:
+    # If the user just completed a quiz on this checkpoint and failed, teach simply
+    if current_cp.get("user_answers") and not current_cp.get("passed", False):
         return "simplified_teaching"
-    return "administer_quiz"
+    return "create_content"
 
 
 mcp_builder = StateGraph(LearningProjectState)
@@ -612,9 +784,11 @@ learning_project_builder.add_node("final_report_generation", final_report_genera
 learning_project_builder.add_node("save_report_to_file", save_report_to_file)
 learning_project_builder.add_node("generate_structure", generate_structure)
 learning_project_builder.add_node("create_content", create_content)
+learning_project_builder.add_node("teach_checkpoint", teach_checkpoint)
 learning_project_builder.add_node("administer_quiz", administer_quiz)
 learning_project_builder.add_node("evaluate_submission", evaluate_submission)
 learning_project_builder.add_node("simplified_teaching", simplified_teaching)
+learning_project_builder.add_node("course_completed", course_completed)
 
 # New flow: START -> clarify_with_user -> check_data_exists
 learning_project_builder.add_edge(START, "clarify_with_user")
@@ -633,17 +807,19 @@ learning_project_builder.add_edge("final_report_generation", "generate_structure
 
 learning_project_builder.add_edge("save_report_to_file", END)
 learning_project_builder.add_edge("generate_structure", "create_content")
-learning_project_builder.add_edge("create_content", "administer_quiz")
+learning_project_builder.add_edge("create_content", "teach_checkpoint")
+learning_project_builder.add_edge("teach_checkpoint", "administer_quiz")
 learning_project_builder.add_edge("administer_quiz", "evaluate_submission")
 learning_project_builder.add_edge("simplified_teaching", "administer_quiz")
+learning_project_builder.add_edge("course_completed", END)
 
 learning_project_builder.add_conditional_edges(
     "evaluate_submission",
     decide_next_step,
     {
-        "administer_quiz": "administer_quiz",
+        "create_content": "create_content",
         "simplified_teaching": "simplified_teaching",
-        END: END,
+        "course_completed": "course_completed",
     },
 )
 

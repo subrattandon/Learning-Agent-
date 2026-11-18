@@ -195,13 +195,16 @@ def summarize_webpage_content(webpage_content: str) -> str:
         Formatted summary with key excerpts
     """
     try:
+        # Truncate raw content to prevent exceeding local LLM context limits (e.g., 8192 tokens)
+        truncated_content = webpage_content[:6000] if len(webpage_content) > 6000 else webpage_content
+
         # Set up structured output model for summarization
         structured_model = summarization_model.with_structured_output(Summary)
 
         # Generate summary
         summary = structured_model.invoke([
             HumanMessage(content=summarize_webpage_prompt.format(
-                webpage_content=webpage_content, 
+                webpage_content=truncated_content, 
                 date=get_today_str()
             ))
         ])
